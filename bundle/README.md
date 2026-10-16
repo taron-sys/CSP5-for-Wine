@@ -1,4 +1,4 @@
-# CLIP STUDIO PAINT on Linux — test package (v0.1.17)
+# CLIP STUDIO PAINT on Linux — test package (v0.1.18)
 
 Hello! This package installs **CLIP STUDIO PAINT 5** into its own Wine environment and ships a
 **pen pressure fix** (Wine's built-in Wintab delivers no pressure under Linux and sporadic
