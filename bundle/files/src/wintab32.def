@@ -1,0 +1,20 @@
+LIBRARY wintab32.dll
+EXPORTS
+    WTInfoW        @1020
+    WTOpenW        @1021
+    WTGetW         @1061
+    WTClose        @22
+    WTPacketsGet   @23
+    WTPacketsPeek  @80
+    WTEnable       @40
+    WTOverlap      @41
+    WTQueueSizeGet @84
+    WTQueueSizeSet @85
+; --- CSP compatibility additions (Wintab 1.4 API surface CSP imports) ---
+    WTPacket       @24
+    WTDataGet      @81
+    WTDataPeek     @82
+    WTMgrOpen      @100
+    WTMgrClose     @101
+    WTMgrExt       @180
+    WTQueuePacketsEx @200

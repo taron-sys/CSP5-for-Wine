@@ -1,0 +1,33 @@
+# =============================================================================
+# CSP5-for-Wine — ignore rules
+# =============================================================================
+
+# --- Local, machine-specific workspaces (regenerable from the bundle) -------
+wineprefix-csp/
+installer/wine-portable/
+testruns/
+e2e-test-*/
+example_files/
+
+# --- CSP installer payload (download once, install, ignore) ----------------
+CSP_*_setup.exe
+
+# --- Generated release artifacts (publish as release assets, not in git) ---
+csp-linux-bundle-*.tar.gz
+csp-linux-bundle-*.tar.gz.sha256
+
+# --- Logs & tool output (the curated bundle test log stays tracked) --------
+*.log
+!bundle/e2e-test.log
+*.err
+
+# --- Native diagnostic binaries (built on the target machine) ---------------
+# xi2-probe/xi1-probe are checked in for historical reasons; new tools build
+# themselves via install-xwintab.sh or verify.sh (needs gcc + libX11/libXi).
+diag/xi2-devname
+
+# --- OS / editor cruft ------------------------------------------------------
+*.swp
+*~
+.DS_Store
+diag/dcomp-shim/build/

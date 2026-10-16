@@ -1,0 +1,109 @@
+# Lutris install script (DRAFT, untested in Lutris) for csp-linux-bundle.
+#
+# Idea: Lutris only provides the game folder, download and launcher entry. The bundle's own
+# install.sh does everything else (portable Wine 11.19, CSP silent install, dcomp shim, DXVK,
+# tablet fix), and run-csp.sh starts the app with the right Wine and WebView2 environment.
+# Hence runner "linux" (a script is the "game"), not Lutris's wine runner: the Lutris
+# wine runner would use its own Wine and prefix handling, which breaks the Wine >= 11.19 /
+# shim / WINEPREFIX assumptions.
+#
+# Wine: always the portable Wine 11.19 Staging (--wine-portable), even if the system has a newer
+# or older Wine. The bundle's maximized-window fix (patched win32u/winex11) only matches that build.
+#
+# Things to fill in / verify before submitting to lutris.net:
+#   * files: url — currently "N/A:" (file picker) for testers; set the public download URL of
+#     the tarball for a release (the current origin is an internal Gitea).
+#   * checksum — sha256 of the tarball for the pinned version below.
+#   * `checksum:` key syntax and `launch_configs:` need Lutris >= 0.5.13 (check on the target).
+#   * Whether `execute` with `command:` + `bash` is accepted without `terminal:` in the
+#     reviewed version.
+#
+# Test locally:   lutris -i drafts/lutris-csp5-wine.yml
+name: CLIP STUDIO PAINT 5
+game_slug: clip-studio-paint-5-wine
+version: Linux bundle (Wine 11.19 portable)
+slug: clip-studio-paint-5-wine
+runner: linux
+
+description: >-
+  CLIP STUDIO PAINT 5.0.4 with working pen pressure, Hub/Login/Asset-Store panels (WebView2),
+  GPU acceleration and a correctly placed maximized window. Installs a private Wine 11.19 and a dedicated prefix inside the game
+  folder; nothing touches ~/.wine-csp or other Wine setups. The CLIP STUDIO installer (~1 GB)
+  is downloaded from Celsys and checked against a pinned SHA256.
+
+notes: |
+  Requirements: a Vulkan-capable GPU (Mesa/NVIDIA), curl, tar, mingw-w64 (g++) and patch
+  (to build the WebView2 display shim), ~12 GB free disk space.
+  First installation takes several minutes (Wine ~100 MB, CSP ~1 GB, silent setup).
+  The "Hub" launch option starts the CLIP STUDIO launcher (login, asset store).
+  Pen tablets: see the bundle README (tablet device name, XWINTAB_* variables).
+
+# dcomp shim: the package contains NO prebuilt dcomp.dll (upstream CSPenguin code has no
+# license). install.sh downloads the pinned upstream source (SHA256 checked), applies our
+# patch and builds it, so mingw-w64 and `patch` must be installed on the host:
+#   Arch: mingw-w64-gcc patch   Debian/Ubuntu: g++-mingw-w64-x86-64 patch   Fedora: mingw64-gcc-c++ patch
+# Without them install.sh falls back to the unpatched upstream DLL (Hub content has gaps).
+# That is why they are listed in require-binaries below; drop that line to make it optional.
+#
+# Flatpak Lutris is NOT covered by this script: the sandbox has no mingw/patch, so the shim
+# falls back to the unpatched DLL there (everything else works, tested with Lutris 0.5.22).
+# File access in Flatpak: flatpak override --user --filesystem=home net.lutris.Lutris
+
+script:
+  require-binaries: x86_64-w64-mingw32-g++, patch, curl, tar
+
+  files:
+    - bundle:
+        # Test build: Lutris asks for the downloaded tarball (file picker).
+        # For a public release replace with: https://<host>/csp-linux-bundle-0.1.22.tar.gz
+        url: N/A:Select csp-linux-bundle-0.1.22.tar.gz
+        filename: csp-linux-bundle-0.1.22.tar.gz
+        checksum: sha256:72e42cfba7d6b856f432c527473ead5882903311979bcc31f38331a71cdd9eee
+
+  game:
+    # $GAMEDIR is filled in by Lutris at install time
+    exe: $GAMEDIR/bundle/run-csp.sh
+    args: --prefix "$GAMEDIR/prefix" editor
+    working_dir: $GAMEDIR/bundle
+    launch_configs:
+      - name: CLIP STUDIO (Hub)
+        exe: $GAMEDIR/bundle/run-csp.sh
+        args: --prefix "$GAMEDIR/prefix" hub
+        working_dir: $GAMEDIR/bundle
+
+  installer:
+    # Language of the program. CLIP STUDIO fixes it at install time (the official way to change
+    # it later is to reinstall); install.sh --language also switches an existing install.
+    # Lutris shows this as a dropdown and passes the choice on as $INPUT_LANGUAGE.
+    - input_menu:
+        id: LANGUAGE
+        description: Language of CLIP STUDIO PAINT
+        options:
+          - en: English
+          - de: Deutsch
+          - fr: Français
+          - es: Español
+          - pt: Português (Brasil)
+          - ja: 日本語
+          - ko: 한국어
+          - zh-cn: 简体中文
+          - zh-tw: 繁體中文
+          - th: ไทย
+          - id: Bahasa Indonesia
+        preselect: en
+    # Lutris merges a single top-level folder of the archive into dst, so the tarball's
+    # csp-linux-bundle-<ver>/ contents land directly in $GAMEDIR/bundle (no move step).
+    - extract:
+        file: bundle
+        dst: $GAMEDIR/bundle
+    - chmodx: $GAMEDIR/bundle/install.sh
+    - chmodx: $GAMEDIR/bundle/run-csp.sh
+    - execute:
+        working_dir: $GAMEDIR/bundle
+        command: >-
+          bash "$GAMEDIR/bundle/install.sh" --prefix "$GAMEDIR/prefix"
+          --wine-portable --wine-portable-dir "$GAMEDIR/wine" --no-shortcuts
+          --language $INPUT_LANGUAGE
+
+  # Uninstall: removing the game in Lutris deletes $GAMEDIR (prefix + Wine + bundle),
+  # so no separate uninstall step is needed.

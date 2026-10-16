@@ -1,0 +1,502 @@
+--- a/dcomp_csp.cpp	2026-10-11 00:00:16.025857758 +0200
++++ b/dcomp_csp.cpp	2026-10-11 00:22:18.181447992 +0200
+@@ -11,6 +11,7 @@
+ 
+ #include <vector>
+ #include <cstdio>
++#include <windowsx.h>
+ 
+ /* MinGW's dcomp.h is incomplete, so all IIDs are hardcoded. */
+ static const GUID MY_IID_IDCompositionVisual =
+@@ -42,6 +43,47 @@
+ static const GUID MY_IID_IDXGISwapChain =
+     {0x310d36a0,0xd2e7,0x4c0a,{0xaa,0x04,0x6a,0x9d,0x23,0xb8,0x88,0x6a}};
+ 
++/* ---------------------------------------------------------------------------
++ * Repaint registry
++ *
++ * Problem: the GDI blit into the NRB host is ONE-SHOT. Wine does not keep the
++ * content. On every redraw of the HWND (expose, restore after minimising,
++ * WM_PAINT, resize) the area is empty again; the user sees that as flicker.
++ *
++ * Solution: we hook into the WndProc of the target HWND (subclassing) and
++ * blit the most recently seen frame again on WM_PAINT/ WM_ERASEBKGND.
++ * In addition a maintenance thread periodically re-emits all dirty targets
++ * (fallback in case Wine replaces the WndProc).
++ * ------------------------------------------------------------------------- */
++
++struct FakeTarget;                    /* fwd */
++static CRITICAL_SECTION  g_dirtyLock;  /* protects g_dirty */
++static bool              g_dirtyInit = false;
++static std::vector<FakeTarget *> g_dirty;
++static LONG              g_repaintCount = 0;
++static LONG              g_presentCount = 0;
++/* Parent-DC blit, Present forwarding, subclassing and the repaint thread only
++   apply in the WebView2 process (msedgewebview2.exe). CLIPStudio.exe and
++   CLIPStudioPaint.exe draw their own native dialogs (settings, security
++   settings, ...) via DirectComposition — there the upstream behaviour stays;
++   with our subclassing these dialogs no longer reacted to clicks (see the
++   v0.1.14 release notes). Set in DllMain. */
++static bool              g_webview = false;
++
++static void dirty_register(FakeTarget *t);
++static void dirty_unregister(FakeTarget *t);
++static void present_bound(void *swap, ID3D11Texture2D *tex);   /* Present -> Target */
++static void unbind_swap(void *swap);
++
++static void dirty_init()
++{
++    /* Idempotent, without loader-lock problems: only initialise on demand */
++    if (!g_dirtyInit) {
++        InitializeCriticalSection(&g_dirtyLock);
++        g_dirtyInit = true;
++    }
++}
++
+ /* Debug log */
+ static FILE *gLog = nullptr;
+ 
+@@ -73,7 +115,7 @@
+     FakeCompositionSwapChain(ID3D11Device *d, const DXGI_SWAP_CHAIN_DESC1 *pd)
+         : dev(d) { dev->AddRef(); desc1 = *pd; create_tex(); }
+ 
+-    ~FakeCompositionSwapChain() { if (tex) tex->Release(); dev->Release(); }
++    ~FakeCompositionSwapChain() { unbind_swap(this); if (tex) tex->Release(); dev->Release(); }
+ 
+     void create_tex()
+     {
+@@ -119,7 +161,11 @@
+     { return dev->QueryInterface(riid, ppv); }
+ 
+     /* IDXGISwapChain */
+-    HRESULT STDMETHODCALLTYPE Present(UINT,UINT) override { return S_OK; }
++    /* Chromium only calls Device::Commit() when the layer tree changes,
++       new frames arrive via Present() instead. Without forwarding the frame
++       of the last commit would stay (e.g. black after navigation). */
++    HRESULT STDMETHODCALLTYPE Present(UINT,UINT) override
++    { if (tex && g_webview) present_bound(this, tex); return S_OK; }
+     HRESULT STDMETHODCALLTYPE GetBuffer(UINT buf, REFIID riid, void **ppSurface) override
+     {
+         if (!tex || buf != 0) { *ppSurface = nullptr; return DXGI_ERROR_INVALID_CALL; }
+@@ -370,6 +416,12 @@
+ };
+ 
+ /* FakeTarget : IDCompositionTarget */
++/* Own window message: "present the last frame on the WINDOW thread via
++   UpdateLayeredWindow". Important: under Wine ULW must not come from the
++   commit thread (deadlock against the window thread / no
++   persistent backing on LAYERED|NRB children). */
++static const UINT WM_CSP_PRESENT = WM_APP + 0x4350;
++
+ struct FakeTarget final : IDCompositionTarget
+ {
+     volatile LONG ref = 1;
+@@ -382,9 +434,33 @@
+     UINT               stagingW  = 0, stagingH = 0;
+     BYTE              *gdiBuf    = nullptr;   /* contiguous BGRA row buffer */
+ 
++    /* Repaint support: keep the last frame and subclass the window
++       so that we can blit again on WM_PAINT. */
++    BYTE              *lastBuf   = nullptr;   /* copy of the last frame (BGRA) */
++    UINT               lastW = 0, lastH = 0;
++    /* Protects lastBuf/lastW/lastH against the commit thread (free/malloc in
++       commit_texture) vs. window thread/repaint thread (reading in repaint).
++       Without this lock repaint() can read a buffer that was just freed or
++       is partially rewritten -> use-after-free / torn picture on resize. */
++    CRITICAL_SECTION   frameLock;
++    bool               frameLockInit = false;
++    WNDPROC            origProc  = nullptr;
++    bool               subclassed = false;
++    /* One Present per frame: commit sets the flag + PostMessage, the
++       window thread resets it when it presents. Prevents the queue
++       from filling up with present messages at 60 fps. */
++    volatile LONG      presentPending = 0;
++    bool               isLayered  = false;
++    bool               destroyed  = false;   /* WM_NCDESTROY gesehen */
++    /* Swapchain whose content this target showed last (comparison only,
++       never dereferenced) — so that Present() can deliver the frame directly. */
++    void * volatile    boundSwap  = nullptr;
+     FakeTarget(HWND h)
+         : hwnd(h), exstyle(h ? GetWindowLong(h, GWL_EXSTYLE) : 0)
+     {
++        isLayered = (exstyle & WS_EX_LAYERED) != 0;
++        InitializeCriticalSection(&frameLock);
++        frameLockInit = true;
+         /* Walk the parent chain: if any ancestor has WS_EX_NOREDIRECTIONBITMAP
+            OR is the E583090D outer-popup class (wine 10.x doesn't propagate NRB
+            down into child windows), this target belongs to a popup subtree. */
+@@ -400,7 +476,59 @@
+                 break;
+             }
+         }
+-        LOG("FakeTarget hwnd=%p inPopupTree=%d ex=%08lx", h, (int)inPopupTree, exstyle);
++        LOG("FakeTarget hwnd=%p inPopupTree=%d ex=%08lx layered=%d", h, (int)inPopupTree, exstyle, (int)isLayered);
++    }
++
++    /* Presentation: child windows in Wine 11.x have no window surface of their
++       own (win32u get_window_surface: is_child → needs_surface=FALSE).
++       GDI on the own child DC is wiped by every parent repaint,
++       and UpdateLayeredWindow on children composes nothing at all (dummy surface).
++       The experiment disp-test.exe proves: the blit into the parent's DC at the
++       child offset lands in the SAME window surface Wine also draws
++       Chromium into — and SURVIVES repaints and MoveWindow there.
++       buf = BGRA (unchanged, opaque). */
++    bool present_on_hwnd(const BYTE *buf, UINT w, UINT h)
++    {
++        if (!buf || !w || !h) return false;
++        if (destroyed || !hwnd || !IsWindow(hwnd)) return false;   /* avoid recycled HWNDs */
++        /* Hidden targets (old page, collapsed panel) must not paint
++           over the visible one — they share parent and offset. */
++        if (!IsWindowVisible(hwnd)) return false;
++        RECT client = {};
++        GetClientRect(hwnd, &client);
++        if (client.right <= 0 || client.bottom <= 0) return false;
++
++        HWND parent = GetParent(hwnd);
++        RECT cr     = { 0, 0, 0, 0 };
++        bool child  = false;
++        if (parent && (GetWindowLong(hwnd, GWL_STYLE) & WS_CHILD)) {
++            child = true;
++            /* child rect in parent coordinates */
++            POINT pt = { 0, 0 };
++            MapWindowPoints(hwnd, parent, &pt, 1);
++            cr.left = pt.x; cr.top = pt.y;
++        }
++        HDC hdc = child ? GetDC(parent) : GetDC(hwnd);
++        if (!hdc) return false;
++        /* Only write the own client rectangle (the texture can be larger
++           than the window and would otherwise paint over siblings). */
++        IntersectClipRect(hdc, cr.left, cr.top, cr.left + client.right, cr.top + client.bottom);
++
++        BITMAPINFO bmi = {};
++        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
++        bmi.bmiHeader.biWidth       = (LONG)w;
++        bmi.bmiHeader.biHeight      = -(LONG)h;   /* top-down */
++        bmi.bmiHeader.biPlanes      = 1;
++        bmi.bmiHeader.biBitCount    = 32;
++        bmi.bmiHeader.biCompression = BI_RGB;
++
++        SetDIBitsToDevice(hdc, child ? cr.left : 0, child ? cr.top : 0, w, h,
++                          0, 0, 0, h, buf, &bmi, DIB_RGB_COLORS);
++        ReleaseDC(child ? parent : hwnd, hdc);
++        if ((++g_presentCount % 200) == 1)
++            LOG("present hwnd=%p %ux%u at %s (%ld,%ld)", hwnd, w, h,
++                child ? "parent-dc" : "own-dc", child ? cr.left : 0, child ? cr.top : 0);
++        return true;
+     }
+     ~FakeTarget()
+     {
+@@ -408,8 +536,18 @@
+         if (stagingTex) stagingTex->Release();
+         if (d3dDev)     d3dDev->Release();
+         free(gdiBuf);
++        free(lastBuf);
++        dirty_unregister(this);
++        unsubclass();
++        if (frameLockInit) DeleteCriticalSection(&frameLock);
+     }
+ 
++    /* WndProc replacement: re-blit the last frame on WM_PAINT/WM_ERASEBKGND */
++    static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
++    void subclass();
++    void unsubclass();
++    void repaint();
++
+     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override
+     {
+         if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, MY_IID_IDCompositionTarget)) {
+@@ -451,6 +589,11 @@
+         UINT w = sd.Width, h = sd.Height;
+         if (w == 0 || h == 0) return false;
+ 
++        /* 1x1 "swapchains" are created at size 0. Blitting them at (0,0)
++           sets exactly one pixel in the window corner ("a single white pixel on
++           the top left"). Draw nothing, look for the next candidate. */
++        if (g_webview && (w < 2 || h < 2)) return false;
++
+         /* (Re-)create staging texture when size changes */
+         if (!stagingTex || stagingW != w || stagingH != h) {
+             if (stagingTex) { stagingTex->Release(); stagingTex = nullptr; }
+@@ -497,25 +640,47 @@
+         ctx2->Unmap(stagingTex, 0);
+         ctx2->Release();
+ 
+-        /* GDI blit to HWND */
+-        HDC hdc = GetDC(hwnd);
+-        if (!hdc) return false;
++        if (!g_webview) {
++            /* Upstream: one-shot GDI blit into the own HWND */
++            HDC hdc = GetDC(hwnd);
++            if (!hdc) return false;
++            BITMAPINFO bmi = {};
++            bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
++            bmi.bmiHeader.biWidth       = (LONG)w;
++            bmi.bmiHeader.biHeight      = -(LONG)h;   /* top-down */
++            bmi.bmiHeader.biPlanes      = 1;
++            bmi.bmiHeader.biBitCount    = 32;
++            bmi.bmiHeader.biCompression = BI_RGB;
++            SetDIBitsToDevice(hdc, 0, 0, w, h, 0, 0, 0, h, gdiBuf, &bmi, DIB_RGB_COLORS);
++            ReleaseDC(hwnd, hdc);
++            return true;
++        }
+ 
+-        BITMAPINFO bmi = {};
+-        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+-        bmi.bmiHeader.biWidth       = (LONG)w;
+-        bmi.bmiHeader.biHeight      = -(LONG)h;   /* top-down */
+-        bmi.bmiHeader.biPlanes      = 1;
+-        bmi.bmiHeader.biBitCount    = 32;
+-        bmi.bmiHeader.biCompression = BI_RGB;
++        /* copy the last frame (for repaint) — under frameLock, because
++           repaint() reads the same buffer on the window/repaint thread. */
++        EnterCriticalSection(&frameLock);
++        if (lastW != w || lastH != h) {
++            free(lastBuf); lastBuf = nullptr;
++            lastBuf = (BYTE *)malloc(rowBytes * h);
++            if (lastBuf) { lastW = w; lastH = h; }
++        }
++        if (lastBuf) memcpy(lastBuf, gdiBuf, rowBytes * h);
++        LeaveCriticalSection(&frameLock);
+ 
+-        SetDIBitsToDevice(hdc, 0, 0, w, h,
+-                          0, 0, 0, h,
+-                          gdiBuf, &bmi, DIB_RGB_COLORS);
+-        ReleaseDC(hwnd, hdc);
++        /* from now on re-blit by ourselves on WM_PAINT */
++        subclass();
++        dirty_register(this);
++
++        /* Present immediately (parent-DC blit, cross-thread ok);
++           subclassing + maintenance thread provide persistence afterwards. */
++        present_on_hwnd(gdiBuf, w, h);
+         return true;
+     }
+ 
++    /* Bind a swapchain to this target; the same swapchain may only be attached
++       to one target (the one committed last wins). */
++    void bind_swap(void *swap);
++
+     /* Walk visual tree, present first content found */
+     bool commit_visual(FakeVisual *v)
+     {
+@@ -532,6 +697,7 @@
+                     bool ok = false;
+                     if (SUCCEEDED(sc->GetBuffer(0, MY_IID_ID3D11Texture2D, (void**)&buf)))
+                     { ok = commit_texture(buf); buf->Release(); }
++                    if (ok) bind_swap(sc);
+                     sc->Release();
+                     if (ok) return true;
+                 }
+@@ -565,6 +731,185 @@
+     }
+ };
+ 
++/* ---- Repaint implementation -------------------------------------------- */
++
++static void dirty_register(FakeTarget *t)
++{
++    dirty_init();
++    EnterCriticalSection(&g_dirtyLock);
++    bool known = false;
++    for (auto *x : g_dirty) if (x == t) { known = true; break; }
++    if (!known) g_dirty.push_back(t);
++    LeaveCriticalSection(&g_dirtyLock);
++}
++
++static void dirty_unregister(FakeTarget *t)
++{
++    if (!g_dirtyInit) return;
++    EnterCriticalSection(&g_dirtyLock);
++    for (auto it = g_dirty.begin(); it != g_dirty.end(); ++it)
++        if (*it == t) { g_dirty.erase(it); break; }
++    LeaveCriticalSection(&g_dirtyLock);
++}
++
++void FakeTarget::bind_swap(void *swap)
++{
++    dirty_init();
++    EnterCriticalSection(&g_dirtyLock);
++    for (auto *x : g_dirty)
++        if (x != this && x->boundSwap == swap) x->boundSwap = nullptr;
++    LeaveCriticalSection(&g_dirtyLock);
++    if (boundSwap != swap) LOG("bind swap=%p -> hwnd=%p", swap, hwnd);
++    boundSwap = swap;
++}
++
++static void unbind_swap(void *swap)
++{
++    if (!g_dirtyInit) return;
++    EnterCriticalSection(&g_dirtyLock);
++    for (auto *x : g_dirty) if (x->boundSwap == swap) x->boundSwap = nullptr;
++    LeaveCriticalSection(&g_dirtyLock);
++}
++
++static LONG g_presentPushCount = 0;
++static void present_bound(void *swap, ID3D11Texture2D *tex)
++{
++    if (!g_dirtyInit) return;
++    FakeTarget *t = nullptr;
++    EnterCriticalSection(&g_dirtyLock);
++    for (auto *x : g_dirty)
++        if (x->boundSwap == swap && !x->destroyed && x->hwnd) { t = x; t->AddRef(); break; }
++    LeaveCriticalSection(&g_dirtyLock);
++    if (!t) return;
++    t->commit_texture(tex);
++    if ((InterlockedIncrement(&g_presentPushCount) % 300) == 1)
++        LOG("Present->target: %ldx (hwnd=%p)", g_presentPushCount, t->hwnd);
++    t->Release();
++}
++
++/* Write the last frame into the HWND again.
++   Now runs exclusively on the window thread (from within wnd_proc),
++   no longer on the commit thread — so UpdateLayeredWindow/GDI work
++   reliably and without a cross-thread deadlock. */
++void FakeTarget::repaint()
++{
++    if (destroyed || !hwnd || !IsWindow(hwnd)) return;
++
++    /* Frame snapshot under lock (commit_texture can do
++       free/malloc on lastBuf at the same time). */
++    EnterCriticalSection(&frameLock);
++    if (!lastBuf || !lastW || !lastH) { LeaveCriticalSection(&frameLock); return; }
++    UINT w = lastW, h = lastH;
++    size_t sz = (size_t)w * h * 4;
++    BYTE *snap = (BYTE *)malloc(sz);
++    if (snap) memcpy(snap, lastBuf, sz);
++    LeaveCriticalSection(&frameLock);
++    if (!snap) return;
++
++    /* Presentation: parent-DC blit (persists in Wine's window surface). */
++    present_on_hwnd(snap, w, h);
++    free(snap);
++    InterlockedIncrement(&g_repaintCount);
++    if ((g_repaintCount % 200) == 1)
++        LOG("repaint: %ldx (hwnd=%p %ux%u child=%d)", g_repaintCount, hwnd, w, h,
++            (int)((GetWindowLong(hwnd, GWL_STYLE) & WS_CHILD) != 0));
++}
++
++LRESULT CALLBACK FakeTarget::wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
++{
++    /* Find the target by HWND (the WndProc is bound per target,
++       but we only get the HWND — so go through the registry). */
++    FakeTarget *self = nullptr;
++    if (msg == WM_PAINT || msg == WM_ERASEBKGND || msg == WM_NCPAINT ||
++        msg == WM_SIZE || msg == WM_WINDOWPOSCHANGED ||
++        msg == WM_CSP_PRESENT || msg == WM_NCDESTROY) {
++        dirty_init();
++        EnterCriticalSection(&g_dirtyLock);
++        for (auto *t : g_dirty) if (t->hwnd == h) { self = t; break; }
++        LeaveCriticalSection(&g_dirtyLock);
++    }
++
++    /* WM_NCDESTROY: the window is being destroyed -> detach the target so that no
++       repaint is started on a dead/recycled HWND any more. */
++    if (msg == WM_NCDESTROY && self) {
++        self->destroyed = true;
++        /* After origProc set the WndProc chain back to the origin. */
++        LRESULT r = self->origProc ? CallWindowProcW(self->origProc, h, msg, wp, lp)
++                                   : DefWindowProcW(h, msg, wp, lp);
++        self->hwnd = nullptr;
++        self->subclassed = false;
++        /* NOT SetWindowLongPtr here — the window is already being torn down. */
++        dirty_unregister(self);
++        return r;
++    }
++
++    LRESULT r = 0;
++    if (self && self->origProc)
++        r = CallWindowProcW(self->origProc, h, msg, wp, lp);
++    else
++        r = DefWindowProcW(h, msg, wp, lp);
++
++    /* Re-blit after the original. On WM_PAINT/ERASEBKGND (redraw), on
++       WM_WINDOWPOSCHANGED/WM_SIZE (resize/move — exactly the action that made
++       the content flicker) and of course on our explicit
++       present message, present the last frame (again). */
++    if (self && (msg == WM_PAINT || msg == WM_ERASEBKGND || msg == WM_NCPAINT ||
++                 msg == WM_WINDOWPOSCHANGED || msg == WM_SIZE ||
++                 msg == WM_CSP_PRESENT)) {
++        if (msg == WM_CSP_PRESENT)
++            InterlockedExchange(&self->presentPending, 0);  /* release the slot */
++        self->repaint();
++    }
++
++    return r;
++}
++
++void FakeTarget::subclass()
++{
++    if (subclassed || !hwnd || destroyed || !IsWindow(hwnd)) return;
++    SetLastError(0);
++    origProc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)wnd_proc);
++    if (origProc) {
++        subclassed = true;
++        LOG("repaint: subclassed hwnd=%p (orig=%p)", hwnd, origProc);
++    } else {
++        LOG("repaint: subclassing hwnd=%p failed (err=%lu)", hwnd, GetLastError());
++    }
++}
++
++void FakeTarget::unsubclass()
++{
++    if (subclassed && hwnd && origProc) {
++        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)origProc);
++        subclassed = false;
++    }
++}
++
++/* Maintenance thread: periodically re-blits dirty targets (fallback in case
++   the subclassing does not take effect). Deliberately slow so that it hardly
++   costs any CPU on a still picture — new frames arrive via Commit() anyway. */
++static DWORD WINAPI repaint_thread(LPVOID)
++{
++    for (;;) {
++        /* Fallback: the subclassing (WM_PAINT) handles the normal case.
++           Only follow up rarely here so that it hardly costs CPU. */
++        Sleep(2000);
++        dirty_init();
++        std::vector<FakeTarget *> snapshot;
++        EnterCriticalSection(&g_dirtyLock);
++        snapshot = g_dirty;
++        LeaveCriticalSection(&g_dirtyLock);
++        for (auto *t : snapshot) {
++            if (!t || t->destroyed || !t->hwnd || !IsWindow(t->hwnd)) continue;
++            if (!IsWindowVisible(t->hwnd)) continue;
++            if (IsIconic(t->hwnd)) continue;
++            t->repaint();   /* parent-DC blit is cross-thread ok */
++        }
++    }
++    return 0;
++}
++
++/* Walk visual tree, present first content found */
+ /* FakeSurface : IDCompositionSurface */
+ struct FakeSurface final : IDCompositionSurface
+ {
+@@ -839,6 +1184,9 @@
+ {
+     /* Wait for DLLs to finish loading before hooking (avoids loader deadlock from DllMain) */
+     Sleep(150);
++    /* Marker for install.sh/verify.sh (detect outdated patched builds) */
++
++    LOG("shim csp-linux rev2 webview=%d", (int)g_webview);
+     IDXGIFactory2 *fac = nullptr;
+     HRESULT hr = CreateDXGIFactory(MY_IID_IDXGIFactory2, (void**)&fac);
+     LOG("deferred hook: CreateDXGIFactory -> %08lx fac=%p", hr, fac);
+@@ -852,9 +1200,16 @@
+ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
+ {
+     if (reason == DLL_PROCESS_ATTACH) {
++        char exe[MAX_PATH] = {};
++        GetModuleFileNameA(nullptr, exe, sizeof(exe));
++        g_webview = strstr(exe, "msedgewebview2") != nullptr;
+         /* Hook DXGI from a thread to avoid touching the loader lock */
+         HANDLE t = CreateThread(nullptr, 0, deferred_hook_thread, nullptr, 0, nullptr);
+         if (t) CloseHandle(t);
++        if (g_webview) {
++            HANDLE rt = CreateThread(nullptr, 0, repaint_thread, nullptr, 0, nullptr);
++            if (rt) CloseHandle(rt);
++        }
+     }
+     return TRUE;
+ }

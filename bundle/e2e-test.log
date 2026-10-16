@@ -1,0 +1,63 @@
+# Verbose end-to-end log of the bundle installer (v0.1.17, 2026-10-11) — real run on a fresh prefix
+# (system Wine 11.19, no local CSP installer, so it was downloaded and SHA256-checked).
+# Paths were shortened; on other machines the prefix is the directory chosen with --prefix
+# (default: ~/.wine-csp). The ANSI colours are stripped.
+csp-linux-bundle 0.1.17
+Prefix: /home/user/.wine-csp-test
+==> 1/6 checking prerequisites
+ OK  wine: wine-11.19 (Staging)
+ OK  pen pressure fix files present
+==> 2/6 Wine prefix
+==>   creating (WINEARCH=win64) …
+ OK  prefix created
+ OK  Wine provides the WinRT classes CSP 5 needs
+==> 2b/6 Wine addons (Gecko/Mono) + dcomp (WebView2)
+==>   system addons found under /usr/share/wine (Wine uses them without a download):
+==>     wine-gecko-2.47.4-x86
+==>     wine-gecko-2.47.4-x86_64
+==>     wine-mono-11.3.0
+==>   Wine: wine-11.19 (Staging) expects Gecko 2.47.4 / Mono 11.3.0
+ OK  Wine Gecko (MSHTML/IE-UI) 2.47.4 installed
+ OK  Wine Mono (.NET) 11.3.0 installed
+==>   building dcomp shim (upstream source + patch) …
+ OK  dcomp shim built + installed (patched: Hub content + clicks)
+==>   winetricks -q dxvk vkd3d  (downloads ~15 MB, changes DllOverrides) …
+ OK  DXVK/VKD3D installed (native d3d9/d3d11/d3d12/dxgi)
+ OK  DXVK configuration written: /home/user/.wine-csp-test/dxvk.conf
+==> 3/6 CLIP STUDIO PAINT
+==>   no CSP installer found -> downloading CSP_504w_setup.exe from CELSYS (~470 MB) …
+ OK  CSP installer downloaded, SHA256 verified: /home/user/.cache/wine/CSP_504w_setup.exe
+==>   silent installation starting — this takes a few minutes (a window appears briefly) …
+ OK  CSP installed: /home/user/.wine-csp-test/drive_c/Program Files/CELSYS/CLIP STUDIO 1.5/CLIP STUDIO PAINT
+==> 4/6 installing the pen pressure fix
+ OK  device name for WTInfo(DVC_NAME): "xwayland-tablet stylus:11"
+ OK  DLLs copied + Wine override 'wintab32=native' set
+==> 5/6 menu entries
+ OK  launcher installed: /home/user/.wine-csp-test/csp-launcher/run-csp.sh
+ OK  entry "CLIP STUDIO PAINT" (editor, recommended) -> run-csp.sh
+ OK  entry "CLIP STUDIO (Hub)" (login/assets) -> run-csp.sh
+ OK  Wine entry redirected: CLIP STUDIO/CLIP STUDIO.desktop
+==> 6/6 done
+Start:
+  Editor directly (recommended):   WINEPREFIX="/home/user/.wine-csp-test" wine "C:\\Program Files\\CELSYS\\CLIP STUDIO 1.5\\CLIP STUDIO PAINT\\CLIPStudioPaint.exe"
+  or menu: "CLIP STUDIO PAINT" / "CLIP STUDIO (Hub)"  (they call run-csp.sh with all the fixes)
+Pen diagnostics (open the window, draw over it with the pen):
+  WINEPREFIX="/home/user/.wine-csp-test" wine "/home/user/.wine-csp-test/drive_c/Program Files/CELSYS/CLIP STUDIO 1.5/CLIP STUDIO PAINT/t5w.exe"
+  Expected: lines with  pressure=<changing values>
+Adjust tilt (if the brush gets too wide when tilting):
+  XWINTAB_ALT_SCALE=7 WINEPREFIX="/home/user/.wine-csp-test" wine "…\\CLIPStudioPaint.exe"   # Default 9
+Wine addons:  Gecko=2.47.4  Mono=11.3.0
+dcomp shim:   installed (patched)
+GPU path:     DXVK/VKD3D installed   (native d3d9/d3d11/d3d12/dxgi)
+Wine WinRT:   OK   (MISSING = CSP crashes when starting the editor -> update Wine)
+  (log of the addon installation: /home/user/.wine-csp-test/addon-install.log)
+Recommended start (sets the Wine paths correctly):
+  /home/user/csp-linux-bundle-0.1.17/run-csp.sh                 # editor
+  /home/user/csp-linux-bundle-0.1.17/run-csp.sh hub             # launcher/login
+  /home/user/csp-linux-bundle-0.1.17/run-csp.sh --kill          # on 'version mismatch' (an old Wine server is still running)
+run-csp.sh sets automatically:
+  WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=…--no-sandbox --in-process-gpu --renderer-process-limit=1 --user-agent=…
+  DXVK_STATE_CACHE=1  DXVK_CONFIG_FILE="/home/user/.wine-csp-test/dxvk.conf"  mesa_glthread=true
+  (needed so the buttons in the Hub menu are clickable and the panels render)
+Uninstall/rollback:  ./uninstall.sh
+Checklist & troubleshooting:  README.md

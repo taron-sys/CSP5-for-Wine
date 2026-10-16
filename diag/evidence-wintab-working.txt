@@ -1,0 +1,30 @@
+=== CSP Wintab init (proof: CSP now uses WinTab) ===
+INIT_LOG_CALLED
+Loaded XWinTabHelper.dll.so
+Loaded helper functions
+Using device: 11
+WTInfoW: probe (0,0) -> tablet present
+WTInfow: unhandled cat 400 idx 0
+WTInfoW: Request for default logcontext
+WTOpenW: called (enabled) hwnd 00000000000F0060
+WTOpenW: Begin context creation
+WTOpenW: Started Event Thread
+WTQueueSizeSet: 1024
+WTInfow: unhandled cat 100 idx 1
+
+=== Pressure probe (ramp 12026 -> 44548) ===
+event: x 59798 y 224777 p 12026 tltx 54 tlty -10 serial 12024
+event: x 59798 y 224777 p 12026 tltx 54 tlty -10 serial 12025
+event: x 59817 y 224891 p 16556 tltx 54 tlty -10 serial 12028
+event: x 59817 y 224891 p 16556 tltx 54 tlty -10 serial 12029
+event: x 59910 y 224970 p 17753 tltx 54 tlty -10 serial 12030
+event: x 59910 y 224970 p 17753 tltx 54 tlty -10 serial 12031
+event: x 59983 y 225027 p 18189 tltx 54 tlty -10 serial 12032
+event: x 59983 y 225027 p 18189 tltx 54 tlty -10 serial 12033
+event: x 59996 y 220918 p 47021 tltx 51 tlty 0 serial 12482
+event: x 59996 y 220918 p 47021 tltx 51 tlty 0 serial 12483
+event: x 59976 y 221061 p 47118 tltx 51 tlty 0 serial 12484
+event: x 59976 y 221061 p 47118 tltx 51 tlty 0 serial 12485
+
+=== Statistics ===
+WT_PACKETs: 28898
