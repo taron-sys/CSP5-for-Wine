@@ -1,5 +1,11 @@
 # CLIP STUDIO PAINT 5 on Linux (Wine)
 
+> [!WARNING] 
+> Attention Attention! This project has been LLM assisted. Use with caution.
+> These tools working for me doesn't mean they will work for you.
+> This is a personal tool and findings I put together for myself,
+> And if it helps others, I'd love to hear about it.
+
 Run **CLIP STUDIO PAINT 5** on Linux with Wine, including the parts that usually break:
 
 | | Status |
