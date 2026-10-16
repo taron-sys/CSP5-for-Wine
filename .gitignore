@@ -31,3 +31,6 @@ diag/xi2-devname
 *~
 .DS_Store
 diag/dcomp-shim/build/
+
+# LLMs
+.agents.md

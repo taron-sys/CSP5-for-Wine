@@ -388,3 +388,6 @@ against "version mismatch").
 | `csp-linux-bundle-0.1.8.tar.gz` | installer + fix + docs (slim, needs internet for addons) |
 | `csp-linux-bundle-0.1.8-offline.tar.gz` | additionally Gecko 2.47.4 + Mono 10.4.1/11.3.0 (offline-capable) |
 | `…tar.gz.sha256` | SHA-256 checksums |
+
+## v0.1.18 - Several Fixes
+- There were several fixes untracked in the private repo between these versions.
